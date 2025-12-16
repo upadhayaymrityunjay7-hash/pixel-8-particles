@@ -1,0 +1,338 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+    <title>Pixel 8 Particle System</title>
+    <style>
+        body { 
+            margin: 0; 
+            overflow: hidden; 
+            background: #000; 
+            font-family: 'Roboto', sans-serif; /* Pixel native font style */
+            touch-action: none; /* Prevents scroll on mobile */
+        }
+        canvas { display: block; }
+        
+        /* Mobile UI Container */
+        #ui {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            padding: 20px;
+            box-sizing: border-box;
+            color: white;
+            pointer-events: none;
+            z-index: 20;
+            text-align: center;
+        }
+        
+        h1 { 
+            margin: 0; 
+            font-size: 1.2rem; 
+            text-transform: uppercase; 
+            letter-spacing: 2px;
+            text-shadow: 0 0 10px #00d2ff; 
+        }
+        
+        .instructions {
+            font-size: 0.8rem;
+            color: #aaa;
+            margin-top: 5px;
+            background: rgba(0,0,0,0.5);
+            padding: 5px;
+            border-radius: 8px;
+            display: inline-block;
+        }
+
+        /* Camera Preview - Smaller on mobile to save screen space */
+        #video-container {
+            position: absolute;
+            bottom: 20px;
+            right: 20px; /* moved to right for easier thumb reach */
+            width: 120px;
+            height: 160px;
+            border: 2px solid rgba(255, 255, 255, 0.3);
+            border-radius: 12px;
+            overflow: hidden;
+            z-index: 10;
+            opacity: 0.8;
+            background: #111;
+        }
+        
+        video {
+            width: 100%;
+            height: 100%;
+            object-fit: cover;
+            transform: scaleX(-1);
+        }
+
+        /* START BUTTON OVERLAY (Required for Android) */
+        #overlay {
+            position: absolute;
+            top: 0; left: 0; width: 100%; height: 100%;
+            background: rgba(0,0,0,0.9);
+            display: flex;
+            flex-direction: column;
+            justify-content: center;
+            align-items: center;
+            z-index: 100;
+        }
+        
+        button {
+            background: linear-gradient(45deg, #00d2ff, #3a7bd5);
+            border: none;
+            padding: 15px 40px;
+            color: white;
+            font-size: 1.2rem;
+            border-radius: 30px;
+            font-weight: bold;
+            cursor: pointer;
+            box-shadow: 0 0 20px rgba(0, 210, 255, 0.5);
+            transition: transform 0.2s;
+        }
+        
+        button:active { transform: scale(0.95); }
+        
+        #status { margin-top: 15px; color: #00d2ff; font-size: 0.9rem; }
+    </style>
+</head>
+<body>
+
+<div id="ui">
+    <h1>Pixel Particle Core</h1>
+    <div class="instructions">
+        🤏 Pinch to Expand &nbsp;|&nbsp; ✊ Fist to Morph
+    </div>
+</div>
+
+<div id="overlay">
+    <button id="start-btn">INITIALIZE CAMERA</button>
+    <div id="status">Ready for Pixel 8</div>
+</div>
+
+<div id="video-container">
+    <video id="input_video" playsinline muted autoplay></video>
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/control_utils/control_utils.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js"></script>
+
+<script>
+    // --- MOBILE CONFIGURATION ---
+    // Reduced slightly for guaranteed 60fps on mobile while running CV
+    const PARTICLE_COUNT = 12000; 
+    const PARTICLE_SIZE = 0.25; // Slightly larger for mobile visibility
+    const SHAPES = ['sphere', 'heart', 'saturn', 'flower', 'dna'];
+    
+    let currentShapeIndex = 0;
+    let isFistDetected = false;
+    let lastSwitchTime = 0;
+    let expansionFactor = 0;
+    let handCentroid = { x: 0, y: 0 };
+    let hueOffset = 0;
+    let cameraActive = false;
+
+    // --- THREE.JS SETUP ---
+    const scene = new THREE.Scene();
+    scene.fog = new THREE.FogExp2(0x000000, 0.03);
+
+    const camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 1000);
+    camera.position.z = 28; // Pulled back slightly for mobile vertical FOV
+
+    const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+    document.body.appendChild(renderer.domElement);
+
+    // --- PARTICLES ---
+    const geometry = new THREE.BufferGeometry();
+    const positions = new Float32Array(PARTICLE_COUNT * 3);
+    const targetPositions = new Float32Array(PARTICLE_COUNT * 3);
+    const colors = new Float32Array(PARTICLE_COUNT * 3);
+    
+    for (let i = 0; i < PARTICLE_COUNT * 3; i++) {
+        positions[i] = (Math.random() - 0.5) * 50;
+        targetPositions[i] = positions[i];
+        colors[i] = 1.0;
+    }
+
+    geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+    geometry.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+
+    const material = new THREE.PointsMaterial({
+        size: PARTICLE_SIZE,
+        vertexColors: true,
+        blending: THREE.AdditiveBlending,
+        depthWrite: false,
+        transparent: true,
+        opacity: 0.9,
+        map: new THREE.TextureLoader().load('https://threejs.org/examples/textures/sprites/disc.png')
+    });
+
+    const particles = new THREE.Points(geometry, material);
+    scene.add(particles);
+
+    // --- SHAPE GENERATOR ---
+    function getSpherePoint(r) {
+        const theta = Math.random() * Math.PI * 2;
+        const phi = Math.acos((Math.random() * 2) - 1);
+        return { x: r * Math.sin(phi) * Math.cos(theta), y: r * Math.sin(phi) * Math.sin(theta), z: r * Math.cos(phi) };
+    }
+
+    function generateTargetShape(shapeName) {
+        for (let i = 0; i < PARTICLE_COUNT; i++) {
+            let x, y, z;
+            if (shapeName === 'sphere') {
+                const p = getSpherePoint(9);
+                x=p.x; y=p.y; z=p.z;
+            } else if (shapeName === 'heart') {
+                const t = Math.random() * Math.PI * 2, scale = 0.5;
+                x = scale * 16 * Math.pow(Math.sin(t), 3);
+                y = scale * (13 * Math.cos(t) - 5 * Math.cos(2*t) - 2 * Math.cos(3*t) - Math.cos(4*t));
+                z = (Math.random()-0.5) * 5 * (16 - Math.abs(x/scale)) * 0.1;
+            } else if (shapeName === 'saturn') {
+                if(Math.random()>0.4) { const p=getSpherePoint(5); x=p.x;y=p.y;z=p.z; }
+                else { const a=Math.random()*6.28, r=8+Math.random()*5; x=Math.cos(a)*r; z=Math.sin(a)*r; y=(Math.random()-0.5)*0.5; }
+            } else if (shapeName === 'flower') {
+                const u=Math.random()*6.28, v=Math.random()*3.14, r=6+3*Math.sin(5*u)*Math.sin(5*v);
+                x=r*Math.sin(v)*Math.cos(u); y=r*Math.sin(v)*Math.sin(u); z=r*Math.cos(v);
+            } else if (shapeName === 'dna') {
+                const turn = i/PARTICLE_COUNT * 12 * 3.14, r = 4, h = 20, yPos = (i/PARTICLE_COUNT - 0.5) * h;
+                const strand = (i%2==0)?0:3.14;
+                x = Math.cos(turn+strand)*r; z = Math.sin(turn+strand)*r; y = yPos;
+            }
+            targetPositions[i*3] = x; targetPositions[i*3+1] = y; targetPositions[i*3+2] = z;
+        }
+    }
+    generateTargetShape(SHAPES[0]);
+
+    // --- MEDIAPIPE & MOBILE CAMERA ---
+    const videoElement = document.getElementById('input_video');
+    const startBtn = document.getElementById('start-btn');
+    const statusText = document.getElementById('status');
+
+    function onResults(results) {
+        if (!results.multiHandLandmarks || results.multiHandLandmarks.length === 0) return;
+
+        const landmarks = results.multiHandLandmarks[0];
+        
+        // 1. Centroid
+        handCentroid.x = (landmarks[0].x + landmarks[5].x + landmarks[17].x) / 3;
+        handCentroid.y = (landmarks[0].y + landmarks[5].y + landmarks[17].y) / 3;
+
+        // 2. Pinch (Expansion)
+        const d = Math.sqrt(
+            Math.pow(landmarks[8].x - landmarks[4].x, 2) + 
+            Math.pow(landmarks[8].y - landmarks[4].y, 2)
+        );
+        expansionFactor = THREE.MathUtils.clamp((d - 0.03) * 6, 0, 1.2);
+
+        // 3. Fist (Switch)
+        const tips = [8, 12, 16, 20];
+        let folded = 0;
+        tips.forEach(t => {
+            const dist = Math.sqrt(Math.pow(landmarks[t].x - landmarks[0].x, 2) + Math.pow(landmarks[t].y - landmarks[0].y, 2));
+            if(dist < 0.12) folded++; // slightly adjusted threshold for mobile
+        });
+
+        if (folded >= 3) {
+            if (!isFistDetected && Date.now() - lastSwitchTime > 1200) {
+                isFistDetected = true;
+                currentShapeIndex = (currentShapeIndex + 1) % SHAPES.length;
+                generateTargetShape(SHAPES[currentShapeIndex]);
+                lastSwitchTime = Date.now();
+                // Haptic feedback if available
+                if (window.navigator && window.navigator.vibrate) window.navigator.vibrate(50);
+            }
+        } else {
+            isFistDetected = false;
+        }
+        hueOffset = handCentroid.x;
+    }
+
+    const hands = new Hands({locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`});
+    hands.setOptions({
+        maxNumHands: 1,
+        modelComplexity: 1, // 0 is faster, 1 is more accurate. Pixel 8 can handle 1.
+        minDetectionConfidence: 0.5,
+        minTrackingConfidence: 0.5
+    });
+    hands.onResults(onResults);
+
+    // Mobile Camera Initialization
+    startBtn.addEventListener('click', async () => {
+        statusText.innerText = "Requesting Camera Access...";
+        startBtn.style.display = 'none';
+
+        try {
+            const cameraUtils = new Camera(videoElement, {
+                onFrame: async () => {
+                    await hands.send({image: videoElement});
+                },
+                width: 640,
+                height: 480,
+                // CRITICAL: Request front camera specifically
+                facingMode: 'user' 
+            });
+            await cameraUtils.start();
+            document.getElementById('overlay').style.display = 'none';
+        } catch (e) {
+            statusText.innerText = "Error: Allow Camera Perms & use HTTPS";
+            console.error(e);
+            startBtn.style.display = 'block';
+        }
+    });
+
+    // --- ANIMATION ---
+    const clock = new THREE.Clock();
+    function animate() {
+        requestAnimationFrame(animate);
+        const time = clock.getElapsedTime();
+        const pArr = geometry.attributes.position.array;
+        const cArr = geometry.attributes.color.array;
+
+        // Mobile Rotation Sensitivity
+        particles.rotation.x += ((handCentroid.y - 0.5)*2 - particles.rotation.x) * 0.05;
+        particles.rotation.y += ((handCentroid.x - 0.5)*2 - particles.rotation.y) * 0.05;
+
+        const baseHue = (time * 0.1 + hueOffset) % 1;
+        const color = new THREE.Color();
+
+        for (let i = 0; i < PARTICLE_COUNT; i++) {
+            const i3 = i*3;
+            let cx=pArr[i3], cy=pArr[i3+1], cz=pArr[i3+2];
+            let tx=targetPositions[i3], ty=targetPositions[i3+1], tz=targetPositions[i3+2];
+            
+            // Explosion/Pinch
+            const exp = 1 + (expansionFactor * 3.0);
+            tx*=exp; ty*=exp; tz*=exp;
+            
+            // Movement
+            tx += Math.sin(time+i)*0.1; 
+            
+            pArr[i3] += (tx-cx)*0.06;
+            pArr[i3+1] += (ty-cy)*0.06;
+            pArr[i3+2] += (tz-cz)*0.06;
+
+            const hue = (baseHue + (cy * 0.02)) % 1; 
+            color.setHSL(hue, 1.0, 0.6);
+            cArr[i3] = color.r; cArr[i3+1] = color.g; cArr[i3+2] = color.b;
+        }
+        geometry.attributes.position.needsUpdate = true;
+        geometry.attributes.color.needsUpdate = true;
+        renderer.render(scene, camera);
+    }
+
+    window.addEventListener('resize', () => {
+        camera.aspect = window.innerWidth / window.innerHeight;
+        camera.updateProjectionMatrix();
+        renderer.setSize(window.innerWidth, window.innerHeight);
+    });
+    animate();
+</script>
+</body>
+</html>
